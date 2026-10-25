@@ -2,7 +2,7 @@ name: perf-test
 on:
   workflow_dispatch:
     inputs:
-      only: {description: 'baseline, split, gate or all', default: all}
+      only: {description: 'baseline, split, gate, readme or all', default: all}
 jobs:
   baseline:
     if: inputs.only == 'all' || inputs.only == 'baseline'
@@ -53,3 +53,30 @@ jobs:
     - if: always()
       uses: actions/upload-artifact@v4
       with: {name: gate-check, path: bin/gate-check}
+  smoke-as-documented:
+    # README quick check, verbatim: smoke workload with the default range spec.
+    if: inputs.only == 'all' || inputs.only == 'readme'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with: {go-version-file: go.mod}
+    - run: PERFORMANCE_GENERATOR_CONFIG=$PWD/test/performance/configs/smoke/generator.yaml make test-performance
+    - if: always()
+      run: cat bin/performance/summary.yaml || true
+  readme:
+    # KWOK_NODES, the standalone runner, and both failure paths.
+    if: inputs.only == 'all' || inputs.only == 'readme'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with: {go-version-file: go.mod}
+    - run: make kind && bin/kind create cluster --name lws-performance --image kindest/node:v1.37.0 --wait 1m
+    - run: make test-performance USE_EXISTING_CLUSTER=true KWOK_NODES=5 PERFORMANCE_GENERATOR_CONFIG=$PWD/test/performance/configs/smoke/generator.yaml PERFORMANCE_RANGESPEC=
+    - run: ARTIFACTS=$PWD/bin hack/scratch/readme-check.sh
+    - if: always()
+      uses: actions/upload-artifact@v4
+      with: {name: readme-check, path: bin/readme-check}
