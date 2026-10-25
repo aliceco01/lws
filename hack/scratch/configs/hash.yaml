@@ -1,0 +1,14 @@
+# Scratch: the Hash half of the baseline workload.
+namespace: lws-performance
+timeout: 15m
+nodeSelector: {type: kwok}
+tolerations:
+- {key: kwok.x-k8s.io/node, operator: Exists, effect: NoSchedule}
+classes:
+- {name: small-hash, count: 80, replicas: 2, size: 2, groupIdentity: Hash}
+- {name: large-hash, count: 4, replicas: 10, size: 8, groupIdentity: Hash}
+scale:
+- name: scale-up
+  replicas: {small-hash: 4}
+- name: scale-down
+  replicas: {small-hash: 1, large-hash: 5}
