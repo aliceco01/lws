@@ -1,0 +1,14 @@
+# Scratch: the Ordinal half of the baseline workload.
+namespace: lws-performance
+timeout: 15m
+nodeSelector: {type: kwok}
+tolerations:
+- {key: kwok.x-k8s.io/node, operator: Exists, effect: NoSchedule}
+classes:
+- {name: small-ordinal, count: 80, replicas: 2, size: 2}
+- {name: large-ordinal, count: 4, replicas: 10, size: 8}
+scale:
+- name: scale-up
+  replicas: {small-ordinal: 4}
+- name: scale-down
+  replicas: {small-ordinal: 1, large-ordinal: 5}
