@@ -1,8 +1,11 @@
 name: perf-test
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      only: {description: 'baseline, split, gate or all', default: all}
 jobs:
   baseline:
+    if: inputs.only == 'all' || inputs.only == 'baseline'
     # Item 2: run the full baseline twice.
     strategy:
       fail-fast: false
@@ -17,6 +20,7 @@ jobs:
     - if: always()
       run: cat bin/performance/summary.yaml || true
   split:
+    if: inputs.only == 'all' || inputs.only == 'split'
     # Item 4: Hash and Ordinal on their own, same sizes as the baseline.
     strategy:
       fail-fast: false
@@ -31,6 +35,7 @@ jobs:
     - if: always()
       run: cat bin/performance/summary.yaml || true
   gate:
+    if: inputs.only == 'all' || inputs.only == 'gate'
     # Items 1 and 3: gate drop on a live cluster, and who writes the gate.
     runs-on: ubuntu-latest
     timeout-minutes: 60

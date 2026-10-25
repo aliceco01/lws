@@ -7,7 +7,6 @@
 #    Ready to False (lws-pod-gates-unready). When it heals, both go back True.
 set -euo pipefail
 KUBECTL=${KUBECTL:-kubectl}
-STAGES=${STAGES:-test/performance/kwok/pod-stages.yaml}
 NS=gate-check
 GATE=leaderworkerset.sigs.k8s.io/group-ready
 out=${ARTIFACTS:-.}/gate-check
@@ -63,13 +62,14 @@ if echo "$writers" | grep -qi kwok; then echo "FAIL: KWOK wrote the gate conditi
 echo "== check 2: gate drops and comes back"
 $KUBECTL -n $NS get "$leader" -w -o jsonpath="{.metadata.resourceVersion} ready={.status.conditions[?(@.type==\"Ready\")].status} gate={.status.conditions[?(@.type==\"$GATE\")].status}{\"\\n\"}" > "$out/leader-watch.log" &
 watch_pid=$!
-# Keep the replacement worker Pending, so the group stays broken until we heal it.
-$KUBECTL delete stage lws-pod-running
+# Keep the replacement worker unscheduled, so the group stays broken until we
+# heal it. The KWOK stages are left alone.
+$KUBECTL cordon -l type=kwok
 $KUBECTL -n $NS delete pod -l "leaderworkerset.sigs.k8s.io/group-key=$key,leaderworkerset.sigs.k8s.io/worker-index=1" --wait=true
 $KUBECTL -n $NS wait "$leader" --for=condition=$GATE=false --timeout=2m
 $KUBECTL -n $NS wait "$leader" --for=condition=Ready=false --timeout=2m
 echo "broken: group-ready=$(cond $GATE) Ready=$(cond Ready)"
-$KUBECTL apply -f "$STAGES"
+$KUBECTL uncordon -l type=kwok
 $KUBECTL -n $NS wait "$leader" --for=condition=$GATE=true --timeout=2m
 $KUBECTL -n $NS wait "$leader" --for=condition=Ready=true --timeout=2m
 echo "healed: group-ready=$(cond $GATE) Ready=$(cond Ready)"
