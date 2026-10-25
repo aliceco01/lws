@@ -1,0 +1,24 @@
+name: perf-test
+on:
+  push:
+    branches: [ci-perf-1146-before, ci-perf-1146-after]
+  workflow_dispatch: {}
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+    - name: Run the scalability test
+      run: make test-performance
+    - name: Show summary
+      if: always()
+      run: cat bin/performance/summary.yaml || true
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: performance-${{ github.ref_name }}
+        path: bin/performance
