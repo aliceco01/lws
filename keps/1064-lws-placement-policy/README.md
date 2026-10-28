@@ -308,6 +308,11 @@ annotation later. No group is replaced, and every revision carries its own
 placement, so a group still on an old revision keeps its constraint when its
 worker StatefulSet is rebuilt.
 
+A revision created before this change cannot tell a one-step move from adding
+the field, so on such a revision the one-step move rolls out. The two-step path
+keeps it: add the matching field next to the annotation, then remove the
+annotation once the first update has recorded a new revision.
+
 Revisions created before this change carry no placement in their data. The
 worker StatefulSet takes its key from the group's leader pod in every case, so a
 group on such a revision also keeps the key it was created with.
@@ -399,7 +404,8 @@ but writes the effective value for each level: the field if set, otherwise the
 annotation. Both sources produce the same revision, so:
 
 1. Moving a value between the annotation and the field, in one update or two,
-   keeps the revision and replaces no group.
+   keeps the revision and replaces no group. On a revision created before this
+   change, only the two-step move keeps it, as item 4 explains.
 2. Upgrading the controller keeps the revision. `SetMatchesRevision` applies the
    existing revision to the live object and regenerates the patch, which picks
    up the live annotation, so it matches the new patch even though the stored
@@ -409,11 +415,12 @@ annotation. Both sources produce the same revision, so:
    untracked rollout above.
 4. `ApplyRevision` restores placement from the revision itself and ignores
    the live annotations, so a revision without placement stays without it.
-   When the revision predates this change and carries no `placementPolicy`, the
-   restored object keeps the live field and annotations, as placement was not
-   part of the revision then. Moving between the annotation and the field
-   therefore keeps such a revision too, and a placement change on it behaves as
-   it does today until the next template change records a new revision.
+   Whenever the revision carries no `placementPolicy`, the restored object has
+   no field. When the revision also predates this change, the restored object
+   keeps the live annotations, as they were the only source of placement then.
+   So adding the field to such a revision rolls out, adding a matching field
+   next to the annotation keeps it, and a one-step move from the annotation to
+   the field rolls out, since it cannot be told apart from adding the field.
 
 The field is not defaulted when absent, and an absent policy hashes the same as
 `type: None`, so objects without placement keep their revision.
@@ -486,7 +493,8 @@ None identified.
 - A LeaderWorkerSet that uses only the field produces the same pod templates and
   the same revision as one that uses only the annotation.
 - Moving the value from the annotation to the field, in one update and in two,
-  replaces no group.
+  replaces no group. On a revision created before this change, the two-step move
+  replaces no group and the one-step move rolls out.
 - Changing the annotation value rolls out through a new revision.
 
 ##### e2e tests

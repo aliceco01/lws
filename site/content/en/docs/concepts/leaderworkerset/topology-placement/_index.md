@@ -36,7 +36,7 @@ spec:
 The field replaces the annotations described below, which are deprecated and still work. Notes on using it:
 
 - Setting a level in the field and in the matching annotation is accepted only when both name the same topology key. A level whose `type` is `None` uses the annotation.
-- The effective placement, from the field or the annotations, is part of the LeaderWorkerSet revision. Moving a value from an annotation to the field keeps the revision and replaces no group. Changing the placement, through either one, rolls out through a new revision.
+- The effective placement, from the field or the annotations, is part of the LeaderWorkerSet revision. Moving a value from an annotation to the field keeps the revision and replaces no group. On a LeaderWorkerSet whose current revision was created by a controller older than the field, add the matching field first and remove the annotation in a later update: doing both in one update rolls out. Changing the placement, through either one, rolls out through a new revision.
 - Group level exclusive placement cannot be combined with gang scheduling or workload topology constraints in `spec.scheduling`. Subgroup level placement can.
 - In a DisaggregatedSet role, exclusive placement must not use the same topology key as the DisaggregatedSet `spec.placementPolicy`, and should use a finer one, for example a slice per rack with a group per host.
 - Kueue topology-aware scheduling does not account for the affinity that exclusive placement injects. Admission returns a warning when a pod template also carries Kueue topology annotations.
