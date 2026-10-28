@@ -176,10 +176,23 @@ func TestRevisionPlacementChanges(t *testing.T) {
 			wantKeep: true,
 		},
 		{
-			name:     "revision from before placement was recorded, annotation moved to the field",
+			name:     "revision from before placement was recorded, field added",
+			existing: withoutRecordedPlacement(t, mustNewRevision(t, lws)),
+			live:     withPlacementPolicy(lws, exclusivePlacement("rack")),
+		},
+		{
+			name:     "revision from before placement was recorded, matching field added next to the annotation",
+			existing: withoutRecordedPlacement(t, mustNewRevision(t, rack)),
+			live:     withPlacementPolicy(rack, exclusivePlacement("rack")),
+			wantKeep: true,
+		},
+		{
+			// A revision from before placement was recorded cannot tell this
+			// apart from adding the field, so it rolls. Adding the field next to
+			// the annotation first, then removing the annotation, does not.
+			name:     "revision from before placement was recorded, annotation moved to the field in one update",
 			existing: withoutRecordedPlacement(t, mustNewRevision(t, rack)),
 			live:     withoutExclusiveAnnotation(withPlacementPolicy(rack, exclusivePlacement("rack"))),
-			wantKeep: true,
 		},
 	}
 	for _, tc := range tests {
@@ -220,4 +233,34 @@ func TestApplyRevisionRestoresPlacement(t *testing.T) {
 			t.Errorf("restored %s annotation = %q, want %q", leaderworkerset.ExclusiveKeyAnnotationKey, got, "zone")
 		}
 	})
+
+	t.Run("a revision from before placement was recorded clears the live field", func(t *testing.T) {
+		restored, err := ApplyRevision(withPlacementPolicy(lws, exclusivePlacement("rack")), withoutRecordedPlacement(t, mustNewRevision(t, lws)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if restored.Spec.PlacementPolicy != nil {
+			t.Errorf("restored placementPolicy = %+v, want nil", restored.Spec.PlacementPolicy)
+		}
+	})
+}
+
+func TestSetMatchesRevisionCacheSeesAnnotationChanges(t *testing.T) {
+	lws := wrappers.BuildLeaderWorkerSet("default").Obj()
+	lws.UID = "uid"
+	lws.Generation = 1
+	rack := withExclusiveAnnotation(lws, "rack")
+	existing := mustNewRevision(t, rack)
+	existing.ResourceVersion = "1"
+	cache := lru.New(10)
+
+	if !SetMatchesRevision(rack, mustNewRevision(t, rack), existing, cache) {
+		t.Fatalf("the revision created from the live object must match it")
+	}
+	// The annotation changes without bumping the generation, so only the
+	// proposed revision tells the two calls apart.
+	zone := withExclusiveAnnotation(lws, "zone")
+	if SetMatchesRevision(zone, mustNewRevision(t, zone), existing, cache) {
+		t.Errorf("a cached match hid an exclusive-topology annotation change")
+	}
 }

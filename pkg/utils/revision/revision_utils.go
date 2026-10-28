@@ -198,16 +198,18 @@ func ApplyRevision(lws *leaderworkerset.LeaderWorkerSet, revision *appsv1.Contro
 	}
 	// A revision that records placement is authoritative for it, so the live
 	// exclusive-topology annotations must not add to it. A revision created
-	// before placement was recorded keeps the live field and annotations, since
-	// placement was not part of the revision then.
-	// A revision that records no placement leaves no placementPolicy in its
-	// data, so the patch keeps the live field; clear it.
+	// before placement was recorded keeps the live annotations, since they were
+	// the only source of placement then.
 	if recordsPlacement {
 		delete(restoredLws.Annotations, leaderworkerset.ExclusiveKeyAnnotationKey)
 		delete(restoredLws.Annotations, leaderworkerset.SubGroupExclusiveKeyAnnotationKey)
-		if !placementInData {
-			restoredLws.Spec.PlacementPolicy = nil
-		}
+	}
+	// A revision without placementPolicy in its data leaves the live field in
+	// place after the patch; clear it. This holds for a revision created before
+	// placement was recorded too: the field did not exist then, so a live field
+	// is a change to the revision and must roll the groups.
+	if !placementInData {
+		restoredLws.Spec.PlacementPolicy = nil
 	}
 	// maxGroupRestarts is a live recovery budget, not part of the workload
 	// template identity. Preserve the value from the current object so neither
@@ -265,10 +267,13 @@ func EqualRevision(lhs *appsv1.ControllerRevision, rhs *appsv1.ControllerRevisio
 
 // revisionEqualityCacheKey is the cache key for remembering that a particular
 // revision ResourceVersion is semantically equal to the revision produced from
-// a particular LWS UID at a particular generation.
+// a particular LWS UID at a particular generation. The proposed revision key is
+// part of it because the exclusive-topology annotations are recorded in the
+// revision but do not bump the generation.
 type revisionEqualityCacheKey struct {
 	lwsUID                  types.UID
 	lwsGeneration           int64
+	proposedRevisionKey     string
 	revisionResourceVersion string
 }
 
@@ -283,6 +288,7 @@ func SetMatchesRevision(lws *leaderworkerset.LeaderWorkerSet, proposedRevision *
 	cacheKey := revisionEqualityCacheKey{
 		lwsUID:                  lws.UID,
 		lwsGeneration:           lws.Generation,
+		proposedRevisionKey:     GetRevisionKey(proposedRevision),
 		revisionResourceVersion: existingRevision.ResourceVersion,
 	}
 	if _, ok := cache.Get(cacheKey); ok {
