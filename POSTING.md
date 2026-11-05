@@ -1,4 +1,4 @@
-# Posting checklist (written 2026-11-04)
+# Posting checklist (updated 2026-11-05)
 
 Run this from a session on Alice's Mac where `gh auth status` shows `aliceco01`.
 Post each item with `gh`, exactly as written. Post everything in section A
@@ -12,9 +12,9 @@ report it.
 
 ### A1. kubernetes-sigs/lws#1165: rerun CI
 
-The two failed jobs on `24d1163` (integration, e2e-1.37) died on a
-proxy.golang.org network error while downloading `k8s.io/api`. The PR code is
-not the cause.
+Skip this if the jobs on the PR head (4860757 or later) are already green. The
+earlier failures on `24d1163` (integration, e2e-1.37) died on a proxy.golang.org
+network error while downloading `k8s.io/api`, not on the PR code.
 
 ```bash
 gh pr comment 1165 --repo kubernetes-sigs/lws --body "/retest"
@@ -24,15 +24,19 @@ gh pr comment 1165 --repo kubernetes-sigs/lws --body "/retest"
 
 ```bash
 gh pr comment 1165 --repo kubernetes-sigs/lws --body-file - <<'EOF'
-@ahg-g thanks for the review. I rebased on main and pushed the fixes:
+@ahg-g thanks for both reviews. I rebased on main and pushed the fixes.
 
+From the Nov 2 review:
 - I now re-record a revision without the `placement-recorded` marker under the same key, so later annotation changes create a new revision and roll under `maxUnavailable`/`maxSurge` (5eccf20).
 - I do this as soon as the controller reconciles the LWS, before it compares revisions, so the one-step annotation→field move on a pre-upgrade LWS also keeps the revision. I take the placement from the leader template rather than the live annotation, so an annotation changed during the controller upgrade still rolls out (24d1163).
-- I added the controller integration cases you asked for: annotation and field changes roll under `maxUnavailable`, the annotation→field move keeps the revision key and StatefulSets, and an LWS with an unmarked revision keeps its leader and worker StatefulSets after the upgrade and rolls out on a later annotation change. I also added the one-step move on a pre-upgrade LWS.
-- I updated the KEP's Update Semantics and test plan to match.
-- I also fixed the e2e placement checks Copilot flagged (117ea65).
+- I added the controller integration cases you asked for, plus the one-step move on a pre-upgrade LWS, and updated the KEP's Update Semantics and test plan.
 
-The two red jobs on the last run failed on a proxy.golang.org download error before compiling, so I re-triggered them.
+From the Nov 5 review (4860757):
+- `validatePlacement` again rejects role exclusive placement on any topology key when the DisaggregatedSet `placementPolicy` is not `None`, for the annotations and for the role's `spec.placementPolicy`, using the code you suggested.
+- `ComputeRevisionV1` now includes the role's normalized `spec.placementPolicy` with `omitempty`. It is nil when a role has no exclusive placement, so the pinned v1 hash is unchanged; setting, changing or clearing it changes the revision.
+- I updated KEP-1064's "Interaction With DisaggregatedSet" and the topology-placement docs to say the combination is rejected and why.
+
+I also fixed the e2e placement checks Copilot flagged (117ea65). The red jobs on the earlier run failed on a proxy.golang.org download error before compiling.
 EOF
 ```
 
@@ -47,6 +51,11 @@ List the threads with GraphQL, then resolve only these, and only when unresolved
 - ahg-g, Oct 26: "In `TestRevisionPlacementChanges` and `TestApplyRevisionRestoresPlacement`, test adding `spec.placementPolicy` against a pre-upgrade revision…". Resolve it only if `pkg/utils/revision/revision_placement_test.go` on the PR head has a pre-upgrade "field added" case with `wantKeep: false`. Otherwise leave it and report it.
 - yindia, Oct 25: "This duplicates revisionRecordsPlacement()…" (fixed in 9a862fc)
 - yindia, Oct 25: "KEP validation table says both levels set must use different keys…" (fixed in 4d3c0be)
+
+- ahg-g, Nov 5: `disaggregatedset_webhook.go` "When `spec.placementPolicy.type` is not `None`, reject any role exclusive placement…" (fixed in 4860757)
+- ahg-g, Nov 5: KEP "Update `Interaction With DisaggregatedSet`…" (fixed in 4860757)
+- ahg-g, Nov 5: docs "Replace this note…" (fixed in 4860757)
+- ahg-g, Nov 5: `leaderworkerset_types.go` "In `pkg/utils/disaggregatedset/utils.go`, include a normalized `PlacementPolicy`…" (fixed in 4860757)
 
 Do not resolve the Copilot threads.
 
@@ -108,7 +117,7 @@ Reply in the review thread under Alice's Oct 24 inline comment. If replying in t
 
 ## C. Slack (no gh), for Alice to send to ahg-g
 
-> I rebased the LWS placementPolicy PR (#1165) and pushed fixes for your review: pre-upgrade revisions are re-recorded before the comparison, and the controller integration cases you asked for are in. CLA is green; I re-triggered two jobs that hit a Go proxy download error. Ready for another look when you have time.
+> I pushed fixes for both of your reviews on the LWS placementPolicy PR (#1165): the pre-upgrade revision handling with the integration cases, and the two DisaggregatedSet points (role exclusive placement rejected on any key, and placement in ComputeRevisionV1). CLA is green. Ready for another look when you have time.
 
 ## Report back
 
