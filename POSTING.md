@@ -24,7 +24,7 @@ gh pr comment 1165 --repo kubernetes-sigs/lws --body "/retest"
 
 ```bash
 gh pr comment 1165 --repo kubernetes-sigs/lws --body-file - <<'EOF'
-@ahg-g thanks for both reviews. I rebased on main and pushed the fixes.
+@ahg-g thanks for the reviews. I rebased on main and pushed the fixes.
 
 From the Nov 2 review:
 - I now re-record a revision without the `placement-recorded` marker under the same key, so later annotation changes create a new revision and roll under `maxUnavailable`/`maxSurge` (5eccf20).
@@ -36,8 +36,30 @@ From the Nov 5 review (4860757):
 - `ComputeRevisionV1` now includes the role's normalized `spec.placementPolicy` with `omitempty`. It is nil when a role has no exclusive placement, so the pinned v1 hash is unchanged; setting, changing or clearing it changes the revision.
 - I updated KEP-1064's "Interaction With DisaggregatedSet" and the topology-placement docs to say the combination is rejected and why.
 
-I also fixed the e2e placement checks Copilot flagged (117ea65). The red jobs on the earlier run failed on a proxy.golang.org download error before compiling.
+From the second Nov 5 review (0832ecb):
+- `RecordsPlacement` checks the `placement-recorded` marker before unmarshalling the revision data.
+- `ComputeRevision` normalizes each role's `spec.placementPolicy` with `normalizedPlacementPolicy`, so `{type: None}` no longer changes the v2 hash; nil stays nil.
+- I restored the `"rack"` key in the five DisaggregatedSet webhook cases.
+- `makeLeaderPod` copies the subgroup exclusive-topology key, and `ExpectValidWorkerStatefulSets` checks it on worker StatefulSet templates.
+- I removed the same-topology-key sentence from the PR description and the release note.
+
+I also fixed the e2e placement checks Copilot flagged (117ea65).
 EOF
+```
+
+### A2b. kubernetes-sigs/lws#1165: fix the PR description (ahg-g asked, Nov 5)
+
+Fetch the body, make these two replacements, and write it back. If either sentence is not found word for word, report it and do not edit.
+
+1. Replace the bullet that starts with "DisaggregatedSet `validatePlacement` now rejects a role's placement" with:
+   "- DisaggregatedSet `validatePlacement` rejects a role's exclusive placement, from the field or the annotations, on any topology key when the DisaggregatedSet `spec.placementPolicy` is not `None`. Unversioned DisaggregatedSets include the role's normalized `spec.placementPolicy` in their revision, so placement changes roll out. Role templates are validated again when either exclusive annotation changes."
+2. In the release note, replace "A DisaggregatedSet placementPolicy now conflicts with a role's exclusive placement only when both use the same topology key." with:
+   "A role's exclusive placement, from the field or the annotations, cannot be combined with a non-None DisaggregatedSet placementPolicy."
+
+```bash
+gh pr view 1165 --repo kubernetes-sigs/lws --json body -q .body > /tmp/pr1165-body.md
+# edit /tmp/pr1165-body.md as described above
+gh pr edit 1165 --repo kubernetes-sigs/lws --body-file /tmp/pr1165-body.md
 ```
 
 ### A3. kubernetes-sigs/lws#1165: resolve the addressed review threads
@@ -56,6 +78,7 @@ List the threads with GraphQL, then resolve only these, and only when unresolved
 - ahg-g, Nov 5: KEP "Update `Interaction With DisaggregatedSet`…" (fixed in 4860757)
 - ahg-g, Nov 5: docs "Replace this note…" (fixed in 4860757)
 - ahg-g, Nov 5: `leaderworkerset_types.go` "In `pkg/utils/disaggregatedset/utils.go`, include a normalized `PlacementPolicy`…" (fixed in 4860757)
+- ahg-g, Nov 5 (second review), all fixed in 0832ecb: "Check `placementRecordedAnnotationKey` before calling `revisionDataHasPlacement`…"; "Normalize `role.Spec.PlacementPolicy` in `ComputeRevision`…"; "Restore the `"rack"` topology key in these five existing test cases…"; "Copy `SubGroupExclusiveTopologyKey` onto the synthetic leader pod…"; "Check `SubGroupExclusiveTopologyKey` on worker `StatefulSet` pod templates…"
 
 Do not resolve the Copilot threads.
 
@@ -117,7 +140,7 @@ Reply in the review thread under Alice's Oct 24 inline comment. If replying in t
 
 ## C. Slack (no gh), for Alice to send to ahg-g
 
-> I pushed fixes for both of your reviews on the LWS placementPolicy PR (#1165): the pre-upgrade revision handling with the integration cases, and the two DisaggregatedSet points (role exclusive placement rejected on any key, and placement in ComputeRevisionV1). CLA is green. Ready for another look when you have time.
+> I pushed fixes for all your review comments on the LWS placementPolicy PR (#1165), including today's minor ones, and updated the PR description. CI is green. Ready for another look when you have time.
 
 ## Report back
 
