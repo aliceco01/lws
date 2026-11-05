@@ -36,7 +36,7 @@ From the Nov 5 review (4860757):
 - `ComputeRevisionV1` now includes the role's normalized `spec.placementPolicy` with `omitempty`. It is nil when a role has no exclusive placement, so the pinned v1 hash is unchanged; setting, changing or clearing it changes the revision.
 - I updated KEP-1064's "Interaction With DisaggregatedSet" and the topology-placement docs to say the combination is rejected and why.
 
-From the second Nov 5 review (0832ecb):
+From the second Nov 5 review (83036a3):
 - `RecordsPlacement` checks the `placement-recorded` marker before unmarshalling the revision data.
 - `ComputeRevision` normalizes each role's `spec.placementPolicy` with `normalizedPlacementPolicy`, so `{type: None}` no longer changes the v2 hash; nil stays nil.
 - I restored the `"rack"` key in the five DisaggregatedSet webhook cases.
@@ -78,7 +78,7 @@ List the threads with GraphQL, then resolve only these, and only when unresolved
 - ahg-g, Nov 5: KEP "Update `Interaction With DisaggregatedSet`…" (fixed in 4860757)
 - ahg-g, Nov 5: docs "Replace this note…" (fixed in 4860757)
 - ahg-g, Nov 5: `leaderworkerset_types.go` "In `pkg/utils/disaggregatedset/utils.go`, include a normalized `PlacementPolicy`…" (fixed in 4860757)
-- ahg-g, Nov 5 (second review), all fixed in 0832ecb: "Check `placementRecordedAnnotationKey` before calling `revisionDataHasPlacement`…"; "Normalize `role.Spec.PlacementPolicy` in `ComputeRevision`…"; "Restore the `"rack"` topology key in these five existing test cases…"; "Copy `SubGroupExclusiveTopologyKey` onto the synthetic leader pod…"; "Check `SubGroupExclusiveTopologyKey` on worker `StatefulSet` pod templates…"
+- ahg-g, Nov 5 (second review), all fixed in 83036a3: "Check `placementRecordedAnnotationKey` before calling `revisionDataHasPlacement`…"; "Normalize `role.Spec.PlacementPolicy` in `ComputeRevision`…"; "Restore the `"rack"` topology key in these five existing test cases…"; "Copy `SubGroupExclusiveTopologyKey` onto the synthetic leader pod…"; "Check `SubGroupExclusiveTopologyKey` on worker `StatefulSet` pod templates…"
 
 Do not resolve the Copilot threads.
 
