@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -89,6 +90,60 @@ var _ = ginkgo.Describe("LeaderWorkerSet controller", func() {
 		ginkgo.Entry("created at zero", int32(0)),
 		ginkgo.Entry("scaled down to zero", int32(1)),
 	)
+
+	// reconcileHash creates the revision of an updated LWS from its own call
+	// site, so a rollback during an update is checked in Hash mode as well.
+	ginkgo.It("reuses the revision of the previous template when a Hash LWS rolls back during an update", func() {
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "hash-rollback-"}}
+		gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+		lws := wrappers.BuildLeaderWorkerSet(ns.Name).Replica(2).Size(2).Obj()
+		lws.Spec.GroupIdentity = leaderworkerset.GroupIdentityHash
+		originalWorkerName := lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.Containers[0].Name
+		gomega.Expect(k8sClient.Create(ctx, lws)).To(gomega.Succeed())
+		key := client.ObjectKeyFromObject(lws)
+
+		deploymentRevision := func() string {
+			var deployment appsv1.Deployment
+			if err := k8sClient.Get(ctx, key, &deployment); err != nil {
+				return ""
+			}
+			return deployment.Labels[leaderworkerset.RevisionKey]
+		}
+		// ExpectRevisions also checks the leader StatefulSet, which Hash mode does not have.
+		revisions := func() int {
+			var current leaderworkerset.LeaderWorkerSet
+			if err := k8sClient.Get(ctx, key, &current); err != nil {
+				return -1
+			}
+			list, err := revisionutils.ListRevisions(ctx, k8sClient, &current,
+				labels.SelectorFromSet(labels.Set{leaderworkerset.SetNameLabelKey: current.Name}))
+			if err != nil {
+				return -1
+			}
+			return len(list)
+		}
+		gomega.Eventually(deploymentRevision, testing.Timeout, testing.Interval).ShouldNot(gomega.BeEmpty())
+		gomega.Eventually(revisions, testing.Timeout, testing.Interval).Should(gomega.Equal(1))
+		revisionA := deploymentRevision()
+
+		testing.UpdateWorkerTemplate(ctx, k8sClient, lws)
+		gomega.Eventually(deploymentRevision, testing.Timeout, testing.Interval).ShouldNot(gomega.Equal(revisionA))
+		gomega.Eventually(revisions, testing.Timeout, testing.Interval).Should(gomega.Equal(2))
+
+		// Roll back to the previous template before the update completes.
+		gomega.Eventually(func() error {
+			if err := k8sClient.Get(ctx, key, lws); err != nil {
+				return err
+			}
+			lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.Containers[0].Name = originalWorkerName
+			return k8sClient.Update(ctx, lws)
+		}, testing.Timeout, testing.Interval).Should(gomega.Succeed())
+		gomega.Eventually(deploymentRevision, testing.Timeout, testing.Interval).Should(gomega.Equal(revisionA))
+		// The revision of the previous template is reused, not created a second time.
+		gomega.Consistently(revisions, "2s", testing.Interval).Should(gomega.Equal(2))
+
+		gomega.Expect(testing.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
+	})
 
 	ginkgo.It("deletes owned worker StatefulSets during parallel Hash LWS deletion using a label-scoped ReplicaSet cache", func() {
 		ctx := context.Background()
