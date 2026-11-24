@@ -115,7 +115,8 @@ func TestStatusPendingPreservesOtherWorkAndErrors(t *testing.T) {
 			}
 			statusWrites, creates, scalerWrites := 0, 0, 0
 			injectedErr := apierrors.NewForbidden(schema.GroupResource{}, ds.Name, errors.New("denied"))
-			c := interceptor.NewClient(newTestClient(ds), interceptor.Funcs{
+			base := newTestClient(ds)
+			c := interceptor.NewClient(base, interceptor.Funcs{
 				SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
 					statusWrites++
 					if failure == "status" {
@@ -141,7 +142,15 @@ func TestStatusPendingPreservesOtherWorkAndErrors(t *testing.T) {
 				},
 			})
 			r := newTestReconciler(c)
-			for range 2 {
+			for i := range 2 {
+				if i == 1 {
+					// Give the second reconcile scaler status work to do while the
+					// parent status still waits; an unchanged status is not patched.
+					scaler := &disaggregatedsetv1.DisaggregatedSetRoleScaler{}
+					require.NoError(t, base.Get(t.Context(), client.ObjectKey{Namespace: ds.Namespace, Name: ScalerName(ds.Name, "prefill")}, scaler))
+					scaler.Status = disaggregatedsetv1.DisaggregatedSetRoleScalerStatus{}
+					require.NoError(t, base.Status().Update(t.Context(), scaler))
+				}
 				result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ds)})
 				if failure == "none" {
 					require.NoError(t, err)

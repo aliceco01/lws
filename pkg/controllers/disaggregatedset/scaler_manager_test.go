@@ -290,6 +290,43 @@ func TestScalerManagerWriteStatus(t *testing.T) {
 	assert.Equal(t, metav1.ConditionTrue, got.Status.Conditions[0].Status)
 }
 
+func TestScalerManagerWriteStatusSkipsUnchangedStatus(t *testing.T) {
+	ds := newDSWithRoles("myds", externalRole("prefill"))
+	scaler := &disaggregatedsetv1.DisaggregatedSetRoleScaler{
+		ObjectMeta: metav1.ObjectMeta{Name: "myds-prefill", Namespace: "default", Generation: 2},
+		Spec:       disaggregatedsetv1.DisaggregatedSetRoleScalerSpec{Replicas: 5},
+	}
+	patches := 0
+	cl := interceptor.NewClient(fake.NewClientBuilder().
+		WithScheme(wrappers.DisaggregatedSetTestScheme()).
+		WithObjects(scaler).
+		WithStatusSubresource(&disaggregatedsetv1.DisaggregatedSetRoleScaler{}).
+		Build(), interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, subResource string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			patches++
+			return c.SubResource(subResource).Patch(ctx, obj, patch, opts...)
+		},
+	})
+	m := NewScalerManager(cl, events.NewFakeRecorder(10))
+	key := types.NamespacedName{Name: "myds-prefill", Namespace: "default"}
+	write := func(observed int32) {
+		t.Helper()
+		live := &disaggregatedsetv1.DisaggregatedSetRoleScaler{}
+		require.NoError(t, cl.Get(t.Context(), key, live))
+		require.NoError(t, m.WriteStatus(t.Context(), ds, map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler{"prefill": live}, map[string]int32{"prefill": observed}))
+	}
+
+	write(4)
+	assert.Equal(t, 1, patches, "the first write binds the scaler")
+	write(4)
+	assert.Equal(t, 1, patches, "an unchanged status is not patched again")
+	write(5)
+	assert.Equal(t, 2, patches, "a changed observed count is patched")
+	got := &disaggregatedsetv1.DisaggregatedSetRoleScaler{}
+	require.NoError(t, cl.Get(t.Context(), key, got))
+	assert.EqualValues(t, 5, got.Status.Replicas)
+}
+
 // apierrorsIsNotFound is a tiny local helper to avoid importing apierrors just
 // for one call in tests.
 func apierrorsIsNotFound(err error) bool {

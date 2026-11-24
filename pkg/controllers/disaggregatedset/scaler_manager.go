@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -298,6 +299,10 @@ func (m *ScalerManager) WriteStatus(
 			ObservedGeneration: s.Generation, Reason: "Bound",
 			Message: "Scaler bound to a live DisaggregatedSet role",
 		})
+		// Most reconciles change nothing here; an empty patch is still an API call.
+		if equality.Semantic.DeepEqual(desired.Status, s.Status) {
+			continue
+		}
 		if err := m.client.Status().Patch(ctx, desired, client.MergeFrom(s)); err != nil {
 			return fmt.Errorf("patch scaler %s status: %w", s.Name, err)
 		}
