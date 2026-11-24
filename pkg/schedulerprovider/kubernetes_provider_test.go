@@ -2075,3 +2075,58 @@ func TestKubernetesProviderCreatePodGroupIfNotExistsShortCircuitsAdmittedLeader(
 	assert.Equal(t, "revision-1", pg.Labels[leaderworkerset.RevisionKey])
 	assert.NotNil(t, workloadOwnerReference(pg))
 }
+
+// CreatePodGroupIfNotExists must report a PodGroup owned by someone else as
+// ErrUnexpectedPodGroupOwner, as the SchedulerProvider interface promises, so
+// the pod controller can surface it. A correctly owned PodGroup with another
+// spec is still drift.
+func TestKubernetesCreatePodGroupReportsUnexpectedOwner(t *testing.T) {
+	for name, tc := range map[string]struct {
+		owners    func(lws *leaderworkerset.LeaderWorkerSet) []metav1.OwnerReference
+		wantOwner bool
+	}{
+		"missing controller owner": {
+			owners:    func(*leaderworkerset.LeaderWorkerSet) []metav1.OwnerReference { return nil },
+			wantOwner: true,
+		},
+		"controller owner from a previous LeaderWorkerSet": {
+			owners: func(lws *leaderworkerset.LeaderWorkerSet) []metav1.OwnerReference {
+				return []metav1.OwnerReference{{
+					APIVersion: leaderworkerset.GroupVersion.String(), Kind: "LeaderWorkerSet",
+					Name: lws.Name, UID: "previous-lws-uid", Controller: ptr.To(true),
+				}}
+			},
+			wantOwner: true,
+		},
+		"matching owner with another spec": {
+			owners: func(lws *leaderworkerset.LeaderWorkerSet) []metav1.OwnerReference {
+				return []metav1.OwnerReference{*metav1.NewControllerRef(lws, leaderworkerset.GroupVersion.WithKind("LeaderWorkerSet"))}
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			lws := testScheduledLWS()
+			fakeClient := newKubernetesFakeClientBuilder().Build()
+			provider := NewKubernetesProvider(fakeClient)
+			require.NoError(t, provider.ReconcileScheduling(ctx, lws, 1, "revision-1"))
+			leader := ordinalLeaderPod(lws, "0")
+			leader.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: leaderworkerset.GroupReplacementSchedulingGate}}
+			existing := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+				Name: KubernetesPodGroupName(lws, "0", "revision-1"), Namespace: lws.Namespace,
+				OwnerReferences: tc.owners(lws),
+			}}
+			require.NoError(t, fakeClient.Create(ctx, existing))
+
+			err := provider.CreatePodGroupIfNotExists(ctx, lws, leader)
+			require.Error(t, err)
+			if tc.wantOwner {
+				require.ErrorIs(t, err, ErrUnexpectedPodGroupOwner)
+				assert.Contains(t, err.Error(), string(lws.UID), "the message names the expected owner")
+				return
+			}
+			require.NotErrorIs(t, err, ErrUnexpectedPodGroupOwner)
+			assert.Contains(t, err.Error(), "immutable scheduling configuration drift")
+		})
+	}
+}

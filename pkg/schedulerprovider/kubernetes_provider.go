@@ -516,7 +516,11 @@ func updateMutablePodGroupFields(ctx context.Context, c client.Client, current, 
 		}
 		currentSpec.SchedulingPolicy.Gang.MinCount = desiredSpec.SchedulingPolicy.Gang.MinCount
 	}
-	if !ownerMatches || !reflect.DeepEqual(currentSpec, desiredSpec) {
+	if !ownerMatches {
+		return fmt.Errorf("%w: PodGroup %s/%s has controller owner %s; expected %s",
+			ErrUnexpectedPodGroupOwner, current.Namespace, current.Name, describeControllerOwner(currentOwner), describeControllerOwner(desiredOwner))
+	}
+	if !reflect.DeepEqual(currentSpec, desiredSpec) {
 		return fmt.Errorf("PodGroup %s/%s has immutable scheduling configuration drift", current.Namespace, current.Name)
 	}
 	if current.Labels == nil {
@@ -667,6 +671,14 @@ func workloadControlledByLWS(workload *schedulingv1beta1.Workload, lws *leaderwo
 	ref := workload.Spec.ControllerRef
 	return controllerReferencesEqual(owner, wantOwner) && ref != nil &&
 		ref.APIGroup == leaderworkerset.GroupVersion.Group && ref.Kind == "LeaderWorkerSet" && ref.Name == lws.Name
+}
+
+// describeControllerOwner formats a controller reference for error messages.
+func describeControllerOwner(ref *metav1.OwnerReference) string {
+	if ref == nil {
+		return "<none>"
+	}
+	return fmt.Sprintf("%s %s %s with UID %s", ref.APIVersion, ref.Kind, ref.Name, ref.UID)
 }
 
 func controllerReferencesEqual(current, desired *metav1.OwnerReference) bool {
