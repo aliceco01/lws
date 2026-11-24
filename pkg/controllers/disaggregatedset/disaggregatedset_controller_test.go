@@ -942,3 +942,105 @@ func TestReconcileUpdateStatusPendingReplicaGroupsRequeues(t *testing.T) {
 	require.NoError(t, err, "replica groups pending during status observation must requeue without controller error")
 	assert.Equal(t, ctrl.Result{RequeueAfter: time.Second}, res)
 }
+
+func scalerSeedTestLWS(ds *disaggregatedsetv1.DisaggregatedSet, slice int, role, revision string, replicas int32) *leaderworkersetv1.LeaderWorkerSet {
+	return wrappers.BuildBasicLeaderWorkerSet(disaggregatedsetutils.GenerateName(ds.Name, slice, revision, role), ds.Namespace).
+		Labels(disaggregatedsetutils.GenerateLabels(ds.Name, slice, revision, role)).
+		Replica(int(replicas)).
+		Size(1).
+		StatusReplicas(replicas).
+		ReadyReplicas(replicas).
+		OwnerReference(metav1.OwnerReference{
+			APIVersion: disaggregatedsetv1.GroupVersion.String(),
+			Kind:       "DisaggregatedSet",
+			Name:       ds.Name,
+			UID:        ds.UID,
+			Controller: ptr.To(true),
+		}).
+		WorkerTemplateSpec(corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "nginx:1.0"}}}).
+		Obj()
+}
+
+// External scaling requires a single slice, so moving a two-slice Static
+// DisaggregatedSet to External also removes slice 1. Its LWS are deleted in the
+// foreground and stay in the cache while their Pods drain; the new scaler must
+// still be seeded from the surviving slice only.
+func TestExternalScalerSeedIgnoresRemovedSlice(t *testing.T) {
+	ctx := context.Background()
+	scheme := wrappers.DisaggregatedSetTestScheme()
+
+	ds := wrappers.BuildDisaggregatedSet("seed-slices", "default").
+		Slices(1).
+		WithRole(testControllerRolePrefill, 3, "nginx:1.0").
+		WithRole(testControllerRoleDecode, 3, "nginx:1.0").
+		Obj()
+	markCurrentRevisionHash(ds)
+	ds.Spec.Roles[0].Scaling = &disaggregatedsetv1.RoleScaling{Mode: disaggregatedsetv1.RoleScalingExternal}
+	revision := disaggregatedsetutils.ComputeRevision(ds.Spec.Roles)
+
+	builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ds).
+		WithStatusSubresource(&disaggregatedsetv1.DisaggregatedSet{}, &leaderworkersetv1.LeaderWorkerSet{}, &disaggregatedsetv1.DisaggregatedSetRoleScaler{})
+	for slice := range 2 {
+		for _, role := range []string{testControllerRolePrefill, testControllerRoleDecode} {
+			lws := scalerSeedTestLWS(ds, slice, role, revision, 3)
+			if slice == 1 {
+				// What the API server adds for propagationPolicy: Foreground.
+				lws.Finalizers = []string{metav1.FinalizerDeleteDependents}
+			}
+			builder = builder.WithObjects(lws)
+		}
+	}
+	c := builder.Build()
+	reconciler := newTestDisaggregatedSetReconciler(c, scheme)
+
+	_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: ds.Name, Namespace: ds.Namespace}})
+	require.NoError(t, err)
+
+	removed := &leaderworkersetv1.LeaderWorkerSet{}
+	require.NoError(t, c.Get(ctx, types.NamespacedName{Namespace: ds.Namespace, Name: disaggregatedsetutils.GenerateName(ds.Name, 1, revision, testControllerRolePrefill)}, removed))
+	require.False(t, removed.DeletionTimestamp.IsZero(), "the removed slice must still be draining when the scaler is seeded")
+
+	scaler := &disaggregatedsetv1.DisaggregatedSetRoleScaler{}
+	require.NoError(t, c.Get(ctx, types.NamespacedName{Namespace: ds.Namespace, Name: controller.ScalerName(ds.Name, testControllerRolePrefill)}, scaler))
+	assert.EqualValues(t, 3, scaler.Spec.Replicas, "the scaler must be seeded from the retained slice only")
+
+	prefill := &leaderworkersetv1.LeaderWorkerSet{}
+	require.NoError(t, c.Get(ctx, types.NamespacedName{Namespace: ds.Namespace, Name: disaggregatedsetutils.GenerateName(ds.Name, 0, revision, testControllerRolePrefill)}, prefill))
+	assert.EqualValues(t, 3, *prefill.Spec.Replicas, "the surviving slice must not grow by the removed slice's capacity")
+}
+
+// Scaling is not part of the revision, so a Static->External flip during a
+// rolling update keeps the rollout going. The old and target revisions overlap
+// by maxSurge; the scaler is seeded with the size the rollout converges to.
+func TestExternalScalerSeedDoesNotCountRolloutSurge(t *testing.T) {
+	ctx := context.Background()
+	scheme := wrappers.DisaggregatedSetTestScheme()
+
+	ds := wrappers.BuildDisaggregatedSet("seed-surge", "default").
+		WithRole(testControllerRolePrefill, 3, "nginx:2.0").
+		WithRole(testControllerRoleDecode, 3, "nginx:2.0").
+		Obj()
+	markCurrentRevisionHash(ds)
+	ds.Spec.Roles[0].Scaling = &disaggregatedsetv1.RoleScaling{Mode: disaggregatedsetv1.RoleScalingExternal}
+	target := disaggregatedsetutils.ComputeRevision(ds.Spec.Roles)
+
+	// With prefill maxSurge 1: the old 3 still run and one target group is issued.
+	newPrefill := scalerSeedTestLWS(ds, 0, testControllerRolePrefill, target, 1)
+	newDecode := scalerSeedTestLWS(ds, 0, testControllerRoleDecode, target, 0)
+	for _, lws := range []*leaderworkersetv1.LeaderWorkerSet{newPrefill, newDecode} {
+		lws.Annotations = map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "3"}
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ds,
+		scalerSeedTestLWS(ds, 0, testControllerRolePrefill, "oldrev01", 3),
+		scalerSeedTestLWS(ds, 0, testControllerRoleDecode, "oldrev01", 3),
+		newPrefill, newDecode,
+	).WithStatusSubresource(&disaggregatedsetv1.DisaggregatedSet{}, &leaderworkersetv1.LeaderWorkerSet{}, &disaggregatedsetv1.DisaggregatedSetRoleScaler{}).Build()
+	reconciler := newTestDisaggregatedSetReconciler(c, scheme)
+
+	// The rollout itself may wait for observations; only the seed matters here.
+	_, _ = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: ds.Name, Namespace: ds.Namespace}})
+
+	scaler := &disaggregatedsetv1.DisaggregatedSetRoleScaler{}
+	require.NoError(t, c.Get(ctx, types.NamespacedName{Namespace: ds.Namespace, Name: controller.ScalerName(ds.Name, testControllerRolePrefill)}, scaler))
+	assert.EqualValues(t, 3, scaler.Spec.Replicas, "the seed is the rollout target, not old plus surge")
+}

@@ -299,6 +299,13 @@ func (r *DisaggregatedSetReconciler) resolveRevision(
 // after attach.
 // An unstarted current LWS uses its recorded intent only when no revision of
 // that role is running in its slice. Drained and deliberately zero targets stay zero.
+//
+// Only workloads that will keep serving count: a terminating LWS or one in a
+// slice beyond spec.slices is being removed, and counting it would scale the
+// surviving slice up by the removed capacity. During a rolling update the old
+// and target revisions of a role overlap by up to maxSurge, so a started
+// target counts once at the size the rollout converges to instead of adding
+// the overlapping Specs.
 func (r *DisaggregatedSetReconciler) seedForRole(ctx context.Context, ds *disaggregatedsetv1.DisaggregatedSet, revision string) func(string) (int32, error) {
 	// All missing scalers in this reconcile use one lazily loaded snapshot.
 	load := sync.OnceValues(func() (map[string]int32, error) {
@@ -316,47 +323,48 @@ func (r *DisaggregatedSetReconciler) seedForRole(ctx context.Context, ds *disagg
 		sums := make(map[string]int32)
 		configs := disaggregatedsetutils.GetRoleConfigs(ds)
 		type sliceRole struct{ slice, role string }
-		running := make(map[sliceRole]bool)
+		retained := make(map[sliceRole][]*leaderworkersetv1.LeaderWorkerSet)
+		var order []sliceRole
 		for _, lws := range all {
-			if getLWSReplicas(lws) > 0 {
-				running[sliceRole{lws.Labels[disaggregatedsetv1.SliceLabelKey], lws.Labels[disaggregatedsetv1.RoleLabelKey]}] = true
+			if !retainedForScalerSeed(ds, lws) {
+				continue
 			}
+			key := sliceRole{lws.Labels[disaggregatedsetv1.SliceLabelKey], lws.Labels[disaggregatedsetv1.RoleLabelKey]}
+			if _, found := retained[key]; !found {
+				order = append(order, key)
+			}
+			retained[key] = append(retained[key], lws)
 		}
-		for _, lws := range all {
-			role := lws.Labels[disaggregatedsetv1.RoleLabelKey]
-			replicas := getLWSReplicas(lws)
-			counts, err := subRoleCounts(lws, subRoleReplicasAnnotation)
-			if err != nil {
+		for _, key := range order {
+			group := retained[key]
+			oldRunning := slices.ContainsFunc(group, func(lws *leaderworkersetv1.LeaderWorkerSet) bool {
+				return lws.Labels[disaggregatedsetv1.RevisionLabelKey] != revision && getLWSReplicas(lws) > 0
+			})
+			if replicas, counts, ok, err := rolloutTargetSeed(group, revision, oldRunning); err != nil {
 				return nil, err
+			} else if ok {
+				addScalerSeed(sums, configs, key.role, replicas, counts)
+				continue
 			}
-			// Bootstrap intent is not extra capacity alongside a running old
-			// revision, nor permission to revive a previously drained workload.
-			if lws.Labels[disaggregatedsetv1.RevisionLabelKey] == revision && isUnscaledCreation(lws) &&
-				!running[sliceRole{lws.Labels[disaggregatedsetv1.SliceLabelKey], role}] {
-				if initial, ok := disaggregatedsetutils.GetInitialReplicas(lws); ok {
-					replicas = initial
-				}
-				counts, err = subRoleCounts(lws, disaggregatedsetv1.InitialSubRoleReplicasAnnotationKey)
+			anyRunning := slices.ContainsFunc(group, func(lws *leaderworkersetv1.LeaderWorkerSet) bool { return getLWSReplicas(lws) > 0 })
+			for _, lws := range group {
+				replicas := getLWSReplicas(lws)
+				counts, err := subRoleCounts(lws, subRoleReplicasAnnotation)
 				if err != nil {
 					return nil, err
 				}
-			}
-			sums[role] += replicas
-			if len(counts) == 0 {
-				if config := configs[role]; config != nil && len(config.SubRoles) > 0 {
-					defaults := map[string]int{}
-					for _, child := range config.SubRoles {
-						defaults[child.Name] = int(ptr.Deref(child.Replicas, 1))
+				// Bootstrap intent is not extra capacity alongside a running old
+				// revision, nor permission to revive a previously drained workload.
+				if lws.Labels[disaggregatedsetv1.RevisionLabelKey] == revision && isUnscaledCreation(lws) && !anyRunning {
+					if initial, ok := disaggregatedsetutils.GetInitialReplicas(lws); ok {
+						replicas = initial
 					}
-					counts = fitSubRoles(defaults, int(replicas))
+					counts, err = subRoleCounts(lws, disaggregatedsetv1.InitialSubRoleReplicasAnnotationKey)
+					if err != nil {
+						return nil, err
+					}
 				}
-			}
-			for child, count := range counts {
-				if child == "" {
-					continue // The parent total was already counted above.
-				}
-				key := childRoleKey(role, child)
-				sums[key] += int32(count)
+				addScalerSeed(sums, configs, key.role, replicas, counts)
 			}
 		}
 		return sums, nil
@@ -370,6 +378,62 @@ func (r *DisaggregatedSetReconciler) seedForRole(ctx context.Context, ds *disagg
 			return count, nil
 		}
 		return 1, nil
+	}
+}
+
+// retainedForScalerSeed reports whether lws keeps serving the DisaggregatedSet:
+// it is not terminating and belongs to a slice within spec.slices.
+func retainedForScalerSeed(ds *disaggregatedsetv1.DisaggregatedSet, lws *leaderworkersetv1.LeaderWorkerSet) bool {
+	if !lws.DeletionTimestamp.IsZero() {
+		return false
+	}
+	slice, err := strconv.Atoi(lws.Labels[disaggregatedsetv1.SliceLabelKey])
+	return err == nil && slice >= 0 && slice < int(disaggregatedsetutils.GetSlices(ds))
+}
+
+// rolloutTargetSeed returns the size a rolling update of one (slice, role)
+// converges to, when an old revision is still running and the target revision
+// has started. The target records that size for the planner, per sub-role when
+// it has sub-roles. An unstarted target keeps the old revision's running size.
+func rolloutTargetSeed(group []*leaderworkersetv1.LeaderWorkerSet, revision string, oldRunning bool) (int32, map[string]int, bool, error) {
+	if !oldRunning {
+		return 0, nil, false, nil
+	}
+	index := slices.IndexFunc(group, func(lws *leaderworkersetv1.LeaderWorkerSet) bool {
+		return lws.Labels[disaggregatedsetv1.RevisionLabelKey] == revision
+	})
+	if index < 0 || isUnscaledCreation(group[index]) {
+		return 0, nil, false, nil
+	}
+	target := group[index]
+	if target.Annotations[subRoleReplicasAnnotation] != "" {
+		counts, err := subRoleCounts(target, disaggregatedsetv1.InitialSubRoleReplicasAnnotationKey)
+		if err != nil || len(counts) == 0 {
+			return 0, nil, false, err
+		}
+		return int32(countSubRoles(counts)), counts, true, nil
+	}
+	initial, ok := disaggregatedsetutils.GetInitialReplicas(target)
+	return initial, nil, ok, nil
+}
+
+// addScalerSeed adds one workload's replicas to its role and sub-roles.
+func addScalerSeed(sums map[string]int32, configs map[string]*disaggregatedsetv1.DisaggregatedRoleSpec, role string, replicas int32, counts map[string]int) {
+	sums[role] += replicas
+	if len(counts) == 0 {
+		if config := configs[role]; config != nil && len(config.SubRoles) > 0 {
+			defaults := map[string]int{}
+			for _, child := range config.SubRoles {
+				defaults[child.Name] = int(ptr.Deref(child.Replicas, 1))
+			}
+			counts = fitSubRoles(defaults, int(replicas))
+		}
+	}
+	for child, count := range counts {
+		if child == "" {
+			continue // The parent total was already counted above.
+		}
+		sums[childRoleKey(role, child)] += int32(count)
 	}
 }
 

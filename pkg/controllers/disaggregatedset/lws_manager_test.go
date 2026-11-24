@@ -2181,9 +2181,12 @@ func TestScalerSeedsShareOneLazyObservation(t *testing.T) {
 func TestScalerSeedDistinguishesBootstrapFromDrainedCapacity(t *testing.T) {
 	for _, identity := range []leaderworkersetv1.GroupIdentityType{leaderworkersetv1.GroupIdentityOrdinal, leaderworkersetv1.GroupIdentityHash} {
 		for _, children := range []bool{false, true} {
-			for _, stage := range []string{"created", "takeover", "policy write", "rejected growth", "grown then zero", "zero intent", "old empty", "running old", "other slice", "unmarked zero"} {
+			for _, stage := range []string{"created", "takeover", "policy write", "rejected growth", "grown then zero", "zero intent", "old empty", "running old", "other slice", "removed slice", "terminating old", "started target", "unmarked zero"} {
 				t.Run(fmt.Sprintf("%s/children=%t/%s", identity, children, stage), func(t *testing.T) {
 					ds, role := testManagerDSWithRole("bootstrap")
+					if stage == "other slice" {
+						ds.Spec.Slices = ptr.To[int32](2)
+					}
 					role.Spec.GroupIdentity = identity
 					initial, initialChildren := 4, map[string]int(nil)
 					if stage == "zero intent" {
@@ -2235,18 +2238,46 @@ func TestScalerSeedDistinguishesBootstrapFromDrainedCapacity(t *testing.T) {
 						}
 						require.NoError(t, base.Update(t.Context(), current))
 						want, wantA, wantB = 0, 0, 0
-					case "running old", "other slice":
+					case "running old", "other slice", "removed slice", "terminating old", "started target":
+						if stage == "started target" {
+							// The target revision has started alongside the old one.
+							if children {
+								state := &subRoleState{lws: current, issued: fitSubRoles(initialChildren, 1), initial: initialChildren}
+								require.ErrorIs(t, manager.saveSubRoles(t.Context(), state), errReplicaGroupsPending)
+							} else {
+								require.NoError(t, manager.Scale(t.Context(), ds, current, 1))
+							}
+							require.NoError(t, manager.pending.observed(t.Context(), ds.UID, "0"))
+							require.False(t, isUnscaledCreation(readTestLWS(t, base, current)))
+						}
 						old := current.DeepCopy()
 						old.Name, old.UID, old.ResourceVersion = "old", "old-uid", ""
 						old.Labels[disaggregatedsetv1.RevisionLabelKey] = "old"
+						if stage == "started target" {
+							old.Annotations = nil // Do not copy the target's issued sub-role counts.
+						}
 						old.Spec.Replicas = ptr.To[int32](2)
-						if stage == "other slice" {
+						switch stage {
+						case "other slice":
+							// A running old revision in another slice does not hold back this slice's bootstrap.
 							old.Labels[disaggregatedsetv1.SliceLabelKey] = "1"
 							want, wantA, wantB = 6, 2, 4
-						} else {
+						case "removed slice":
+							// A slice beyond spec.slices is being removed and contributes nothing.
+							old.Labels[disaggregatedsetv1.SliceLabelKey] = "1"
+						case "terminating old":
+							// A terminating revision is leaving and contributes nothing.
+							old.Finalizers = []string{metav1.FinalizerDeleteDependents}
+						case "started target":
+							// The rollout converges to the target's recorded size; the
+							// overlapping old Spec is not added on top of it.
+						default:
 							want, wantA, wantB = 2, 1, 1
 						}
 						require.NoError(t, base.Create(t.Context(), old))
+						if stage == "terminating old" {
+							require.NoError(t, base.Delete(t.Context(), old))
+						}
 					}
 					// A restart discards all local state; only persisted intent counts.
 					r := &DisaggregatedSetReconciler{LWSManager: NewLeaderWorkerSetManager(base)}
