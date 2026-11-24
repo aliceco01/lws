@@ -890,6 +890,45 @@ var _ = ginkgo.Describe("Workload-aware scheduling controller", func() {
 		})
 	})
 
+	// The suite enables GenericWorkload only, as the installation guide does, so
+	// kube-apiserver drops schedulingConstraints, which TopologyAwareWorkloadScheduling serves.
+	ginkgo.It("reports Workload fields that the API server drops instead of creating pods without them", func() {
+		lws := wrappers.BuildLeaderWorkerSet(ns.Name).Name("was-dropped").Replica(1).Size(2).Obj()
+		lws.Spec.Scheduling = &leaderworkerset.LeaderWorkerSetScheduling{
+			Replica: &leaderworkerset.LeaderWorkerSetReplicaScheduling{
+				SchedulingConstraints: &schedulingv1alpha3.WorkloadCompositePodGroupSchedulingConstraints{
+					Topology: []schedulingv1alpha3.TopologyConstraint{{Key: "topology.kubernetes.io/zone"}},
+				},
+			},
+		}
+		gomega.Expect(k8sClient.Create(ctx, lws)).To(gomega.Succeed())
+
+		workload := &schedulingv1beta1.Workload{}
+		gomega.Eventually(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Namespace: ns.Name, Name: schedulerprovider.KubernetesWorkloadName(lws)}, workload)
+		}, testing.Timeout, testing.Interval).Should(gomega.Succeed())
+		if workload.Spec.PodGroupTemplates[0].SchedulingConstraints != nil {
+			ginkgo.Skip("kube-apiserver serves schedulingConstraints in this environment")
+		}
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			persisted := &leaderworkerset.LeaderWorkerSet{}
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(lws), persisted)).To(gomega.Succeed())
+			cond := apimeta.FindStatusCondition(persisted.Status.Conditions, string(leaderworkerset.LeaderWorkerSetWorkloadSchedulingCreated))
+			g.Expect(cond).NotTo(gomega.BeNil())
+			g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(cond.Reason).To(gomega.Equal(schedulerprovider.ReasonUnsupportedProviderCapability))
+			g.Expect(cond.Message).To(gomega.ContainSubstring("schedulingConstraints"))
+			g.Expect(cond.Message).NotTo(gomega.ContainSubstring("drift"))
+		}, testing.Timeout, testing.Interval).Should(gomega.Succeed())
+
+		// No member pod is created without the constraints it asked for.
+		gomega.Consistently(func() bool {
+			err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns.Name, Name: lws.Name}, &appsv1.StatefulSet{})
+			return apierrors.IsNotFound(err)
+		}, "3s", testing.Interval).Should(gomega.BeTrue())
+	})
+
 	ginkgo.It("still scales down and updates status when non-transient scheduling drift occurs", func() {
 		lws := wrappers.BuildLeaderWorkerSet(ns.Name).Name("was-drift-scaledown").Replica(2).Size(2).Obj()
 		lws.Spec.Scheduling = &leaderworkerset.LeaderWorkerSetScheduling{}

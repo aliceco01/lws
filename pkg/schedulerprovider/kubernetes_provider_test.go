@@ -2075,3 +2075,79 @@ func TestKubernetesProviderCreatePodGroupIfNotExistsShortCircuitsAdmittedLeader(
 	assert.Equal(t, "revision-1", pg.Labels[leaderworkerset.RevisionKey])
 	assert.NotNil(t, workloadOwnerReference(pg))
 }
+
+// kube-apiserver drops Workload fields served behind a disabled feature gate
+// instead of rejecting them. The provider must report that rather than create
+// pods without the requested constraints and then fail every later reconcile
+// with immutable drift that the user never made.
+func TestKubernetesReconcileSchedulingReportsFieldsDroppedByAPIServer(t *testing.T) {
+	topologyLWS := func() *leaderworkerset.LeaderWorkerSet {
+		lws := testScheduledLWS()
+		lws.Spec.Scheduling = &leaderworkerset.LeaderWorkerSetScheduling{
+			Replica: &leaderworkerset.LeaderWorkerSetReplicaScheduling{
+				SchedulingConstraints: &schedulingv1alpha3.WorkloadCompositePodGroupSchedulingConstraints{
+					Topology: []schedulingv1alpha3.TopologyConstraint{{Key: "topology.kubernetes.io/zone"}},
+				},
+			},
+		}
+		return lws
+	}
+	claimsLWS := func() *leaderworkerset.LeaderWorkerSet {
+		lws := testScheduledLWS()
+		lws.Spec.Scheduling = &leaderworkerset.LeaderWorkerSetScheduling{
+			Replica: &leaderworkerset.LeaderWorkerSetReplicaScheduling{
+				Worker: &leaderworkerset.LeaderWorkerSetWorkerScheduling{
+					ResourceClaims: []schedulingv1alpha3.WorkloadPodGroupResourceClaim{{
+						Name: "gpu", ResourceClaimTemplateName: ptr.To("shared-gpu-template"),
+					}},
+				},
+			},
+		}
+		lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.ResourceClaims = []corev1.PodResourceClaim{{
+			Name: "gpu", ResourceClaimTemplateName: ptr.To("shared-gpu-template"),
+		}}
+		return lws
+	}
+	dropConstraints := func(template *schedulingv1beta1.PodGroupTemplate) { template.SchedulingConstraints = nil }
+	dropClaims := func(template *schedulingv1beta1.PodGroupTemplate) { template.ResourceClaims = nil }
+
+	for name, tc := range map[string]struct {
+		lws         func() *leaderworkerset.LeaderWorkerSet
+		drop        func(*schedulingv1beta1.PodGroupTemplate)
+		wantDropped string
+	}{
+		"schedulingConstraints dropped": {lws: topologyLWS, drop: dropConstraints, wantDropped: ".schedulingConstraints"},
+		"resourceClaims dropped":        {lws: claimsLWS, drop: dropClaims, wantDropped: ".resourceClaims"},
+		"schedulingConstraints kept":    {lws: topologyLWS},
+		"resourceClaims kept":           {lws: claimsLWS},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			lws := tc.lws()
+			fakeClient := newKubernetesFakeClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if workload, ok := obj.(*schedulingv1beta1.Workload); ok && tc.drop != nil {
+						for i := range workload.Spec.PodGroupTemplates {
+							tc.drop(&workload.Spec.PodGroupTemplates[i])
+						}
+					}
+					return createWithGeneratedUID(ctx, c, obj, opts...)
+				},
+			}).Build()
+			provider := NewKubernetesProvider(fakeClient)
+
+			// The first reconcile creates the Workload; the second finds it persisted.
+			for _, attempt := range []string{"create", "persisted"} {
+				err := provider.ReconcileScheduling(ctx, lws, 1, "revision-1")
+				if tc.drop == nil {
+					require.NoError(t, err, attempt)
+					continue
+				}
+				require.Error(t, err, attempt)
+				assert.Equal(t, ReasonUnsupportedProviderCapability, ReconcileErrorReason(err), attempt)
+				assert.Contains(t, err.Error(), tc.wantDropped, attempt)
+				assert.NotContains(t, err.Error(), "drift", attempt)
+			}
+		})
+	}
+}

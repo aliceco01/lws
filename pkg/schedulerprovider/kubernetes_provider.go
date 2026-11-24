@@ -616,6 +616,11 @@ func (p *KubernetesProvider) reconcileWorkload(ctx context.Context, lws *leaderw
 		if persisted.Name != desiredWorkload.Name {
 			return nil, NewReconcileError(ReasonInvalidSchedulingConfiguration, fmt.Errorf("owned Workload %s/%s does not have the expected UID-qualified name %q", persisted.Namespace, persisted.Name, desiredWorkload.Name))
 		}
+		// The webhook forbids changing these fields, so a missing one was dropped
+		// by the API server rather than changed by the user. Report that, not drift.
+		if err := droppedWorkloadFieldsError(persisted, desiredWorkload); err != nil {
+			return nil, err
+		}
 		// Scale can change whole-LWS gang minCount; other Workload spec fields stay immutable.
 		if err := updateMutableWorkloadFields(ctx, p.client, persisted, desiredWorkload); err != nil {
 			return nil, NewReconcileError(ReasonInvalidSchedulingConfiguration, err)
@@ -623,7 +628,13 @@ func (p *KubernetesProvider) reconcileWorkload(ctx context.Context, lws *leaderw
 		return persisted, nil
 	}
 
+	sent := desiredWorkload.DeepCopy()
 	if err := p.client.Create(ctx, desiredWorkload); err == nil {
+		// Create returns the stored object. Stop before any member pod exists if
+		// the API server silently ignored part of the requested configuration.
+		if err := droppedWorkloadFieldsError(desiredWorkload, sent); err != nil {
+			return nil, err
+		}
 		return desiredWorkload, nil
 	} else if !apierrors.IsAlreadyExists(err) {
 		return nil, workloadAPIError(ReasonWorkloadCreateFailed, fmt.Errorf("create Workload %s/%s: %w", desiredWorkload.Namespace, desiredWorkload.Name, err))
@@ -764,6 +775,46 @@ func cachedControllerOwnerObject(group, kind string) client.Object {
 		return &disaggregatedsetv1.DisaggregatedSet{}
 	}
 	return nil
+}
+
+// droppedWorkloadFieldsError reports PodGroup template fields that desired
+// sets and persisted lacks. kube-apiserver drops fields served behind a
+// disabled feature gate instead of rejecting them, for example
+// schedulingConstraints without TopologyAwareWorkloadScheduling. The
+// LeaderWorkerSet would then be scheduled without the requested constraints
+// and, on every later reconcile, look like immutable drift.
+func droppedWorkloadFieldsError(persisted, desired *schedulingv1beta1.Workload) error {
+	persistedByName := make(map[string]*schedulingv1beta1.PodGroupTemplate, len(persisted.Spec.PodGroupTemplates))
+	for i := range persisted.Spec.PodGroupTemplates {
+		persistedByName[persisted.Spec.PodGroupTemplates[i].Name] = &persisted.Spec.PodGroupTemplates[i]
+	}
+	var dropped []string
+	for i := range desired.Spec.PodGroupTemplates {
+		want := &desired.Spec.PodGroupTemplates[i]
+		got, found := persistedByName[want.Name]
+		if !found {
+			continue // A missing template is template set drift.
+		}
+		path := fmt.Sprintf("spec.podGroupTemplates[name=%q]", want.Name)
+		if want.SchedulingConstraints != nil && got.SchedulingConstraints == nil {
+			dropped = append(dropped, path+".schedulingConstraints")
+		}
+		if len(want.ResourceClaims) > 0 && len(got.ResourceClaims) == 0 {
+			dropped = append(dropped, path+".resourceClaims")
+		}
+		if want.DisruptionMode != nil && got.DisruptionMode == nil {
+			dropped = append(dropped, path+".disruptionMode")
+		}
+		if want.PriorityClassName != "" && got.PriorityClassName == "" {
+			dropped = append(dropped, path+".priorityClassName")
+		}
+	}
+	if len(dropped) == 0 {
+		return nil
+	}
+	return NewReconcileError(ReasonUnsupportedProviderCapability, fmt.Errorf(
+		"kube-apiserver did not persist %s of Workload %s/%s; the feature gate that serves the field is likely disabled",
+		strings.Join(dropped, ", "), persisted.Namespace, persisted.Name))
 }
 
 // updateMutableWorkloadFields applies gang minCount (for example whole-LWS scale)
