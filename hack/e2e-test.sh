@@ -42,6 +42,9 @@ PERFORMANCE_TEST=${PERFORMANCE_TEST:-"false"}
 PERFORMANCE_GENERATOR_CONFIG=${PERFORMANCE_GENERATOR_CONFIG:-"$CWD/test/performance/configs/baseline/generator.yaml"}
 # An empty PERFORMANCE_RANGESPEC skips the limit check.
 PERFORMANCE_RANGESPEC=${PERFORMANCE_RANGESPEC-"$CWD/test/performance/configs/baseline/rangespec.yaml"}
+# PERFORMANCE_AUTO_COMPUTE_DOMAIN=true installs the ComputeDomain CRD and enables
+# the AutoComputeDomain feature gate, for generator configs with autoComputeDomain.
+PERFORMANCE_AUTO_COMPUTE_DOMAIN=${PERFORMANCE_AUTO_COMPUTE_DOMAIN:-"false"}
 KWOK_VERSION=${KWOK_VERSION:-"v0.8.0"}
 KWOK_NODES=${KWOK_NODES:-20}
 GO_CMD=${GO_CMD:-"go"}
@@ -347,6 +350,10 @@ gangSchedulingManagement:
         config_content="$config_content
 featureGates:
   WorkloadAwareScheduling: true"
+    elif [ "$PERFORMANCE_TEST" == "true" ] && [ "$PERFORMANCE_AUTO_COMPUTE_DOMAIN" == "true" ]; then
+        config_content="$config_content
+featureGates:
+  AutoComputeDomain: true"
     fi
     echo "$config_content" > controller_manager_config.yaml
     popd
@@ -379,6 +386,8 @@ EOF
       popd
     elif [ "$USE_FAKE_GPU_OPERATOR" == "true" ]; then
       $KUSTOMIZE build "$CWD/test/e2e/config/fake-gpu" | $KUBECTL apply --server-side -f -
+    elif [ "$PERFORMANCE_TEST" == "true" ] && [ "$PERFORMANCE_AUTO_COMPUTE_DOMAIN" == "true" ]; then
+      $KUSTOMIZE build "$CWD/test/performance/config" | $KUBECTL apply --server-side -f -
     else
       $KUSTOMIZE build $CWD/test/e2e/config | $KUBECTL apply --server-side -f -
     fi
@@ -405,6 +414,13 @@ function deploy_kwok {
         echo "---"
     done | $KUBECTL apply -f -
     $KUBECTL wait --for=condition=Ready node -l type=kwok --timeout=2m
+    # The controller checks for the ComputeDomain API when it starts with the
+    # AutoComputeDomain feature gate, so the CRD comes first. Without the NVIDIA
+    # driver, the runner creates the ResourceClaimTemplate of each ComputeDomain.
+    if [ "$PERFORMANCE_AUTO_COMPUTE_DOMAIN" == "true" ]; then
+        $KUBECTL apply -f "$CWD/test/integration/crd/nvidia-computedomain.yaml"
+        $KUBECTL wait --for=condition=Established crd/computedomains.resource.nvidia.com --timeout=1m
+    fi
 }
 
 function run_performance_test {

@@ -33,6 +33,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -45,6 +46,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
+	"sigs.k8s.io/lws/pkg/computedomain"
 	podutils "sigs.k8s.io/lws/pkg/utils/pod"
 )
 
@@ -135,6 +137,7 @@ func newRunner(ctx context.Context, cfg *Config) (*runner, error) {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(leaderworkerset.AddToScheme(scheme))
+	utilruntime.Must(computedomain.AddToScheme(scheme))
 	c, err := client.New(restConfig, client.Options{Scheme: scheme})
 	if err != nil {
 		return nil, err
@@ -144,9 +147,16 @@ func newRunner(ctx context.Context, cfg *Config) (*runner, error) {
 		return nil, err
 	}
 	// Sync the informers now, so that their first list does not count as latency.
-	for _, obj := range []client.Object{&leaderworkerset.LeaderWorkerSet{}, &corev1.Pod{}} {
+	watched := []client.Object{&leaderworkerset.LeaderWorkerSet{}, &corev1.Pod{}}
+	if cfg.usesDRA() {
+		watched = append(watched, &resourcev1.ResourceClaim{})
+	}
+	if cfg.usesAutoComputeDomain() {
+		watched = append(watched, &computedomain.ComputeDomain{})
+	}
+	for _, obj := range watched {
 		if _, err := informers.GetInformer(ctx, obj); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("watching %T: %w", obj, err)
 		}
 	}
 	go func() {
@@ -172,6 +182,18 @@ func (r *runner) run(ctx context.Context) (*Summary, error) {
 			fmt.Fprintln(os.Stderr, "deleting namespace:", err)
 		}
 	}()
+	if r.cfg.usesDRA() {
+		cleanup, err := r.setUpDRA(ctx)
+		if err != nil {
+			return summary, err
+		}
+		defer cleanup()
+	}
+	if r.cfg.usesAutoComputeDomain() {
+		driverCtx, stopDriver := context.WithCancel(ctx)
+		defer stopDriver()
+		go r.runComputeDomainDriver(driverCtx)
+	}
 	if err := r.waitForController(ctx); err != nil {
 		return summary, err
 	}
@@ -185,11 +207,15 @@ func (r *runner) run(ctx context.Context) (*Summary, error) {
 		if err != nil {
 			return summary, err
 		}
-		summary.Phases = append(summary.Phases, result)
-		fmt.Printf("phase %s: %d groups in %dms\n", phase.Name, result.Groups, result.WallTimeMs)
-		if err := r.checkPods(ctx, phase.Name); err != nil {
+		settle, counts, err := r.checkObjects(ctx, phase.Name)
+		if err != nil {
+			summary.Phases = append(summary.Phases, result)
 			return summary, err
 		}
+		result.SettleMs = settle.Milliseconds()
+		result.ResourceClaims, result.ComputeDomains = counts.resourceClaims, counts.computeDomains
+		summary.Phases = append(summary.Phases, result)
+		fmt.Printf("phase %s: %d groups in %dms, settled after %dms more\n", phase.Name, result.Groups, result.WallTimeMs, result.SettleMs)
 	}
 	return summary, nil
 }
@@ -319,9 +345,11 @@ func reachedTarget(lws *leaderworkerset.LeaderWorkerSet, target int32) bool {
 	return target == 0 || (available != nil && available.Status == metav1.ConditionTrue && available.ObservedGeneration == lws.Generation)
 }
 
-// checkPods waits until each LeaderWorkerSet has exactly as many pods as its
-// target asks for, all running and ready, and there are no other pods.
-func (r *runner) checkPods(ctx context.Context, phase string) error {
+// checkObjects waits until each LeaderWorkerSet has exactly as many pods as its
+// target asks for, all running and ready, there are no other pods, and the
+// numbers of ResourceClaims and ComputeDomains match the targets as well. It
+// returns how long that took and the DRA objects it counted.
+func (r *runner) checkObjects(ctx context.Context, phase string) (time.Duration, draObjects, error) {
 	want := map[string]int{}
 	for _, class := range r.cfg.Classes {
 		for i := range class.Count {
@@ -329,19 +357,29 @@ func (r *runner) checkPods(ctx context.Context, phase string) error {
 			want[name] = int(r.replicas[name] * class.Size)
 		}
 	}
+	wantDRA := r.wantDRAObjects()
 	var mismatch string
-	err := wait.PollUntilContextTimeout(ctx, time.Second, r.cfg.Timeout.Duration, true, func(ctx context.Context) (bool, error) {
+	var counts draObjects
+	begin := time.Now()
+	err := wait.PollUntilContextTimeout(ctx, pollInterval, r.cfg.Timeout.Duration, true, func(ctx context.Context) (bool, error) {
 		pods := &corev1.PodList{}
 		if err := r.cache.List(ctx, pods, client.InNamespace(r.cfg.Namespace)); err != nil {
 			return false, err
 		}
-		mismatch = podMismatch(pods.Items, want)
+		if mismatch = podMismatch(pods.Items, want); mismatch != "" {
+			return false, nil
+		}
+		var err error
+		if counts, err = r.countDRAObjects(ctx); err != nil {
+			return false, err
+		}
+		mismatch = draMismatch(counts, wantDRA)
 		return mismatch == "", nil
 	})
 	if err != nil {
-		return fmt.Errorf("checking the pods after phase %s: %w: %s", phase, err, mismatch)
+		return 0, counts, fmt.Errorf("checking the objects after phase %s: %w: %s", phase, err, mismatch)
 	}
-	return nil
+	return time.Since(begin), counts, nil
 }
 
 // podMismatch returns how the pods differ from want, the number of pods of

@@ -42,6 +42,10 @@ func TestConfigValidate(t *testing.T) {
 		"no LeaderWorkerSets in a class": func(c *Config) { c.Classes[0].Count = 0 },
 		"scale phase of unknown class":   func(c *Config) { c.Scale[0].Replicas = map[string]int32{"other": 1} },
 		"scale phase named like create":  func(c *Config) { c.Scale[0].Name = phaseCreate },
+		"claims without dra":             func(c *Config) { c.Classes[0].ResourceClaimTemplate, c.DRA = true, nil },
+		"compute domains without devices": func(c *Config) {
+			c.Classes[0].AutoComputeDomain, c.DRA = true, &DRAConfig{}
+		},
 	}
 	valid := func() *Config {
 		return &Config{
@@ -68,25 +72,101 @@ func TestConfigValidate(t *testing.T) {
 // The shipped configs must load, and the range spec must only bound phases
 // the baseline config produces.
 func TestShippedConfigs(t *testing.T) {
-	if _, err := loadConfig("../configs/smoke/generator.yaml"); err != nil {
-		t.Error(err)
-	}
-	cfg, err := loadConfig("../configs/baseline/generator.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	spec, err := loadRangeSpec("../configs/baseline/rangespec.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	phases := map[string]bool{phaseCreate: true}
-	for _, phase := range cfg.Scale {
-		phases[phase.Name] = true
-	}
-	for name := range spec.Phases {
-		if !phases[name] {
-			t.Errorf("range spec phase %s is not produced by the baseline config", name)
+	for _, path := range []string{"../configs/smoke/generator.yaml", "../configs/dra-smoke/generator.yaml"} {
+		if _, err := loadConfig(path); err != nil {
+			t.Error(err)
 		}
+	}
+	for _, dir := range []string{"baseline", "dra"} {
+		cfg, err := loadConfig("../configs/" + dir + "/generator.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		spec, err := loadRangeSpec("../configs/" + dir + "/rangespec.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		phases := map[string]bool{phaseCreate: true}
+		for _, phase := range cfg.Scale {
+			phases[phase.Name] = true
+		}
+		for name := range spec.Phases {
+			if !phases[name] {
+				t.Errorf("range spec phase %s is not produced by the %s config", name, dir)
+			}
+		}
+	}
+}
+
+func TestBuildLeaderWorkerSetWithDRA(t *testing.T) {
+	cfg := &Config{Namespace: "ns"}
+	lws := cfg.buildLeaderWorkerSet(Class{Name: "gpu", Replicas: 1, Size: 2, ResourceClaimTemplate: true, AutoComputeDomain: true}, 0)
+	if got := lws.Annotations[leaderworkerset.AutoComputeDomainAnnotationKey]; got != leaderworkerset.AutoComputeDomainEnabled {
+		t.Errorf("auto-compute-domain annotation = %q, want enabled", got)
+	}
+	for _, tpl := range []*corev1.PodTemplateSpec{lws.Spec.LeaderWorkerTemplate.LeaderTemplate, &lws.Spec.LeaderWorkerTemplate.WorkerTemplate} {
+		want := []corev1.PodResourceClaim{{Name: deviceClaimName, ResourceClaimTemplateName: ptr.To("class-gpu")}}
+		if diff := cmp.Diff(want, tpl.Spec.ResourceClaims); diff != "" {
+			t.Errorf("pod resourceClaims (-want +got):\n%s", diff)
+		}
+		container := tpl.Spec.Containers[0]
+		if diff := cmp.Diff([]corev1.ResourceClaim{{Name: deviceClaimName}}, container.Resources.Claims); diff != "" {
+			t.Errorf("container claims (-want +got):\n%s", diff)
+		}
+		if got := tpl.Annotations[leaderworkerset.ComputeDomainContainersAnnotationKey]; got != container.Name {
+			t.Errorf("compute-domain-containers = %q, want %q", got, container.Name)
+		}
+	}
+	plain := cfg.buildLeaderWorkerSet(Class{Name: "plain", Replicas: 1, Size: 1}, 0)
+	if plain.Annotations != nil || plain.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.ResourceClaims != nil {
+		t.Errorf("a class without DRA has annotations %v and claims %v", plain.Annotations, plain.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.ResourceClaims)
+	}
+}
+
+func TestBuildResourceSlices(t *testing.T) {
+	for devices, wantSlices := range map[int]int{1: 1, 128: 1, 129: 2, 250: 2, 300: 3} {
+		slices := buildResourceSlices("node-1", devices)
+		if len(slices) != wantSlices {
+			t.Fatalf("%d devices: %d slices, want %d", devices, len(slices), wantSlices)
+		}
+		names := map[string]bool{}
+		for _, slice := range slices {
+			if slice.Spec.Pool.Name != "node-1" || *slice.Spec.NodeName != "node-1" || slice.Spec.Pool.ResourceSliceCount != int64(wantSlices) {
+				t.Errorf("%d devices: slice %s has pool %+v on node %s", devices, slice.Name, slice.Spec.Pool, *slice.Spec.NodeName)
+			}
+			if slice.Spec.Driver != driverName || slice.Labels[simulatedLabel] == "" {
+				t.Errorf("%d devices: slice %s has driver %s and labels %v", devices, slice.Name, slice.Spec.Driver, slice.Labels)
+			}
+			for _, device := range slice.Spec.Devices {
+				names[device.Name] = true
+			}
+		}
+		if len(names) != devices {
+			t.Errorf("%d devices: %d distinct devices published", devices, len(names))
+		}
+	}
+}
+
+func TestWantDRAObjects(t *testing.T) {
+	r := &runner{
+		cfg: &Config{Classes: []Class{
+			{Name: "claim", Count: 2, Size: 4, ResourceClaimTemplate: true},
+			{Name: "cd", Count: 1, Size: 2, AutoComputeDomain: true},
+			{Name: "both", Count: 1, Size: 2, ResourceClaimTemplate: true, AutoComputeDomain: true},
+			{Name: "plain", Count: 1, Size: 8},
+		}},
+		replicas: map[string]int32{"claim-0": 2, "claim-1": 1, "cd-0": 3, "both-0": 1, "plain-0": 5},
+	}
+	// claim: 3 groups of 4 pods; cd: 3 groups of 2 pods; both: 1 group of 2 pods with 2 claims each.
+	want := draObjects{resourceClaims: 12 + 6 + 4, computeDomains: 3 + 1}
+	if got := r.wantDRAObjects(); got != want {
+		t.Errorf("wantDRAObjects() = %+v, want %+v", got, want)
+	}
+	if got := draMismatch(want, want); got != "" {
+		t.Errorf("draMismatch() of equal counts = %q", got)
+	}
+	if got := draMismatch(draObjects{resourceClaims: 22, computeDomains: 5}, want); got != "5 ComputeDomains, want 4" {
+		t.Errorf("draMismatch() = %q", got)
 	}
 }
 

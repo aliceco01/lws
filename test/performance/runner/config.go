@@ -18,9 +18,12 @@ package main
 import (
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/yaml"
 
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
@@ -46,6 +49,19 @@ type Config struct {
 	Classes []Class `json:"classes"`
 	// Scale lists the scaling phases, run in order after creation.
 	Scale []ScalePhase `json:"scale,omitempty"`
+	// DRA configures the simulated DRA driver. It is required when a class
+	// uses ResourceClaims.
+	DRA *DRAConfig `json:"dra,omitempty"`
+}
+
+// DRAConfig configures the DRA driver the runner simulates, since the
+// simulated nodes run no driver. See dra.go.
+type DRAConfig struct {
+	// DevicesPerNode is the number of devices the runner publishes in
+	// ResourceSlices for each node that matches nodeSelector. Each
+	// ResourceClaim is allocated one device, so it bounds the pods with claims
+	// per node.
+	DevicesPerNode int `json:"devicesPerNode"`
 }
 
 // Class is a set of identical LeaderWorkerSets.
@@ -59,6 +75,36 @@ type Class struct {
 	Size     int32 `json:"size"`
 	// GroupIdentity is Ordinal when unset.
 	GroupIdentity leaderworkerset.GroupIdentityType `json:"groupIdentity,omitempty"`
+	// ResourceClaimTemplate makes every pod reference a ResourceClaimTemplate
+	// of the class, so that each pod gets its own ResourceClaim.
+	ResourceClaimTemplate bool `json:"resourceClaimTemplate,omitempty"`
+	// AutoComputeDomain enables auto-compute-domain (KEP-1259) on the
+	// LeaderWorkerSets: the controller manages a ComputeDomain per group and
+	// injects a ResourceClaim for it into every pod. It needs the
+	// AutoComputeDomain feature gate and the ComputeDomain CRD.
+	AutoComputeDomain bool `json:"autoComputeDomain,omitempty"`
+}
+
+// claimsPerPod is the number of ResourceClaims each pod of the class has.
+func (c Class) claimsPerPod() int {
+	n := 0
+	if c.ResourceClaimTemplate {
+		n++
+	}
+	if c.AutoComputeDomain {
+		n++
+	}
+	return n
+}
+
+// usesDRA reports whether any class gives its pods ResourceClaims.
+func (c *Config) usesDRA() bool {
+	return slices.ContainsFunc(c.Classes, func(class Class) bool { return class.claimsPerPod() > 0 })
+}
+
+// usesAutoComputeDomain reports whether any class enables auto-compute-domain.
+func (c *Config) usesAutoComputeDomain() bool {
+	return slices.ContainsFunc(c.Classes, func(class Class) bool { return class.AutoComputeDomain })
 }
 
 // ScalePhase sets the replicas of every LeaderWorkerSet of the listed classes.
@@ -97,6 +143,9 @@ func (c *Config) validate() error {
 			return fmt.Errorf("class %s: count must be at least 1", class.Name)
 		}
 	}
+	if c.usesDRA() && (c.DRA == nil || c.DRA.DevicesPerNode < 1) {
+		return fmt.Errorf("classes with ResourceClaims need dra.devicesPerNode of at least 1")
+	}
 	phases := map[string]bool{phaseCreate: true}
 	for _, phase := range c.Scale {
 		if phase.Name == "" || phases[phase.Name] {
@@ -131,11 +180,39 @@ func (c *Config) buildLeaderWorkerSet(class Class, index int) *leaderworkerset.L
 	if class.GroupIdentity != "" {
 		lws.Spec.GroupIdentity = class.GroupIdentity
 	}
+	if class.AutoComputeDomain {
+		lws.Annotations = map[string]string{leaderworkerset.AutoComputeDomainAnnotationKey: leaderworkerset.AutoComputeDomainEnabled}
+	}
 	// The images are never pulled: the simulated nodes report the pods Ready.
 	template := &lws.Spec.LeaderWorkerTemplate
-	for _, spec := range []*corev1.PodSpec{&template.LeaderTemplate.Spec, &template.WorkerTemplate.Spec} {
-		spec.NodeSelector = c.NodeSelector
-		spec.Tolerations = c.Tolerations
+	for _, pod := range []*corev1.PodTemplateSpec{template.LeaderTemplate, &template.WorkerTemplate} {
+		pod.Spec.NodeSelector = c.NodeSelector
+		pod.Spec.Tolerations = c.Tolerations
+		if class.ResourceClaimTemplate {
+			pod.Spec.ResourceClaims = append(pod.Spec.ResourceClaims, corev1.PodResourceClaim{
+				Name:                      deviceClaimName,
+				ResourceClaimTemplateName: ptr.To(resourceClaimTemplateName(class)),
+			})
+			for i := range pod.Spec.Containers {
+				claims := &pod.Spec.Containers[i].Resources.Claims
+				*claims = append(*claims, corev1.ResourceClaim{Name: deviceClaimName})
+			}
+		}
+		if class.AutoComputeDomain {
+			// The simulated nodes have no nvidia.com/gpu, so the containers that
+			// get the ComputeDomain channel are named instead of detected.
+			names := make([]string, 0, len(pod.Spec.Containers))
+			for _, container := range pod.Spec.Containers {
+				names = append(names, container.Name)
+			}
+			pod.Annotations = map[string]string{leaderworkerset.ComputeDomainContainersAnnotationKey: strings.Join(names, ",")}
+		}
 	}
 	return lws
+}
+
+// resourceClaimTemplateName is the name of the ResourceClaimTemplate the pods
+// of a class reference.
+func resourceClaimTemplateName(class Class) string {
+	return "class-" + class.Name
 }

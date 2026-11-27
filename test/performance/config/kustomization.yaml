@@ -1,0 +1,11 @@
+# The controller of the e2e tests with the ComputeDomain RBAC, for configs with
+# autoComputeDomain. hack/e2e-test.sh enables the AutoComputeDomain feature
+# gate and installs the ComputeDomain CRD.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- ../../e2e/config
+
+components:
+- ../../../config/components/computedomain

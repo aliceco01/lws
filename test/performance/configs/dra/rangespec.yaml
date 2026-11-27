@@ -1,0 +1,10 @@
+# Upper bounds on the measurements of each phase of the DRA workload. Loose on
+# purpose, like the baseline ones, until runs give data to set them from.
+phases:
+  create:
+    wallTimeMs: 600000
+  scale-up:
+    wallTimeMs: 600000
+  scale-down:
+    wallTimeMs: 600000
+    settleMs: 300000

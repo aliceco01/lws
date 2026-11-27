@@ -1,0 +1,24 @@
+# LeaderWorkerSets that use DRA, in both group identity modes: pods with a
+# ResourceClaimTemplate of their own, LeaderWorkerSets with auto-compute-domain
+# (KEP-1259), and both together. Needs the AutoComputeDomain feature gate and
+# the ComputeDomain CRD, which make test-performance-dra sets up. 1280 pods,
+# 1440 ResourceClaims and 160 ComputeDomains after creation, twice as many
+# after scale-up, and half as many after scale-down.
+namespace: lws-performance
+timeout: 15m
+nodeSelector: {type: kwok}
+tolerations:
+- {key: kwok.x-k8s.io/node, operator: Exists, effect: NoSchedule}
+dra:
+  devicesPerNode: 250
+classes:
+- {name: claim-ordinal, count: 40, replicas: 2, size: 4, resourceClaimTemplate: true}
+- {name: claim-hash, count: 40, replicas: 2, size: 4, groupIdentity: Hash, resourceClaimTemplate: true}
+- {name: cd-ordinal, count: 30, replicas: 2, size: 4, autoComputeDomain: true}
+- {name: cd-hash, count: 30, replicas: 2, size: 4, groupIdentity: Hash, autoComputeDomain: true}
+- {name: claim-cd, count: 20, replicas: 2, size: 4, resourceClaimTemplate: true, autoComputeDomain: true}
+scale:
+- name: scale-up
+  replicas: {claim-ordinal: 4, claim-hash: 4, cd-ordinal: 4, cd-hash: 4, claim-cd: 4}
+- name: scale-down
+  replicas: {claim-ordinal: 1, claim-hash: 1, cd-ordinal: 1, cd-hash: 1, claim-cd: 1}

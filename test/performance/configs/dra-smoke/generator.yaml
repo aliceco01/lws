@@ -1,0 +1,17 @@
+# A few LeaderWorkerSets of each DRA kind, for checking the harness itself.
+# Run it with make test-performance-dra.
+namespace: lws-performance
+timeout: 5m
+nodeSelector: {type: kwok}
+tolerations:
+- {key: kwok.x-k8s.io/node, operator: Exists, effect: NoSchedule}
+dra:
+  devicesPerNode: 250
+classes:
+- {name: claim, count: 4, replicas: 2, size: 2, resourceClaimTemplate: true}
+- {name: cd-ordinal, count: 4, replicas: 2, size: 2, autoComputeDomain: true}
+- {name: cd-hash, count: 4, replicas: 2, size: 2, groupIdentity: Hash, autoComputeDomain: true}
+- {name: claim-cd, count: 2, replicas: 2, size: 2, resourceClaimTemplate: true, autoComputeDomain: true}
+scale:
+- {name: scale-up, replicas: {claim: 4, cd-ordinal: 4, cd-hash: 4, claim-cd: 4}}
+- {name: scale-down, replicas: {claim: 1, cd-ordinal: 1, cd-hash: 1, claim-cd: 1}}

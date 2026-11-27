@@ -229,6 +229,13 @@ test-e2e-fake-gpu: helm ## Run E2E tests with fake GPUs on CPU-only Kind nodes.
 test-performance: kustomize manifests kind-image-build ## Run the scalability test on a kind cluster with simulated KWOK nodes.
 	PERFORMANCE_TEST=true E2E_KIND_VERSION=$(E2E_KIND_VERSION) KIND_CLUSTER_NAME=$(PERFORMANCE_KIND_CLUSTER_NAME) KIND=$(KIND) KUBECTL=$(KUBECTL) KUSTOMIZE=$(KUSTOMIZE) GO_CMD=$(GO_CMD) USE_EXISTING_CLUSTER=$(USE_EXISTING_CLUSTER) IMAGE_TAG=$(IMG) ARTIFACTS=$(ARTIFACTS)/performance ./hack/e2e-test.sh
 
+.PHONY: test-performance-dra
+test-performance-dra: ## Run the scalability test with LeaderWorkerSets that use DRA: ResourceClaimTemplates and auto-compute-domain.
+	PERFORMANCE_AUTO_COMPUTE_DOMAIN=true \
+	PERFORMANCE_GENERATOR_CONFIG=$${PERFORMANCE_GENERATOR_CONFIG:-$(PROJECT_DIR)/test/performance/configs/dra/generator.yaml} \
+	PERFORMANCE_RANGESPEC=$${PERFORMANCE_RANGESPEC-$(PROJECT_DIR)/test/performance/configs/dra/rangespec.yaml} \
+	$(MAKE) test-performance
+
 .PHONY: test-e2e-upgrade
 test-e2e-upgrade: test-e2e-upgrade-manifests
 

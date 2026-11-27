@@ -51,6 +51,14 @@ type PhaseSummary struct {
 	P90Ms           int64   `json:"p90Ms"`
 	P99Ms           int64   `json:"p99Ms"`
 	MaxMs           int64   `json:"maxMs"`
+	// SettleMs runs from the moment every LeaderWorkerSet reached its target
+	// until the pods and the DRA objects matched the targets too, for example
+	// until the pods and ComputeDomains removed by a scale-down were gone.
+	SettleMs int64 `json:"settleMs"`
+	// ResourceClaims and ComputeDomains are the numbers in the workload
+	// namespace at the end of the phase, when the config uses them.
+	ResourceClaims int `json:"resourceClaims,omitempty"`
+	ComputeDomains int `json:"computeDomains,omitempty"`
 	// Controller is unset when the run does not read the controller metrics.
 	Controller *ControllerUsage `json:"controller,omitempty"`
 }
@@ -118,6 +126,7 @@ func (p PhaseSummary) measurements() map[string]float64 {
 		"p90Ms":      float64(p.P90Ms),
 		"p99Ms":      float64(p.P99Ms),
 		"maxMs":      float64(p.MaxMs),
+		"settleMs":   float64(p.SettleMs),
 	}
 	if c := p.Controller; c != nil {
 		m["controller.cpuSeconds"] = c.CPUSeconds
